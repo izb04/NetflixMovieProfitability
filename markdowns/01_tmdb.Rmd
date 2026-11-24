@@ -1,0 +1,425 @@
+
+---
+title: "ISA 401 - TMDb Movie Financial Data"
+author: "Aliya"
+output: html_document
+---
+
+## TMDb Data Acquisition
+
+This document uses the TMDb API to collect movie financial and descriptive data for the ISA 401 theatrical movie analysis.
+
+The input is the 20-movie pilot dataset created in `00_movie_selection.Rmd`.
+
+```{r setup, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(httr2)
+library(jsonlite)
+
+# Run chunks from the project root
+knitr::opts_knit$set(
+  root.dir = normalizePath("..")
+)
+
+# Never store or display the API token
+stopifnot(nzchar(Sys.getenv("TMDB_TOKEN")))
+```
+
+## Load the Shared Movie Master
+
+```{r load_master}
+movie_master <- read.csv(
+  "data/processed/movie_master.csv",
+  stringsAsFactors = FALSE
+)
+
+# Validate the input before making API requests
+stopifnot(
+  nrow(movie_master) == 20,
+  !anyDuplicated(movie_master$movie_id),
+  !anyDuplicated(movie_master$tmdb_id),
+  !anyNA(movie_master$tmdb_id)
+)
+
+# Display the first five records
+head(movie_master, 5)
+```
+
+```{r}
+
+# Retrieve movie details using a confirmed TMDb ID
+
+get_tmdb_details <- function(tmdb_id) {
+
+  response <- request(
+    paste0(
+      "https://api.themoviedb.org/3/movie/",
+      tmdb_id
+    )
+  ) |>
+    req_auth_bearer_token(Sys.getenv("TMDB_TOKEN")) |>
+    req_retry(max_tries = 3) |>
+    req_perform()
+
+  movie <- resp_body_json(
+    response,
+    simplifyVector = TRUE
+  )
+
+  tibble(
+    tmdb_id = movie$id,
+    tmdb_title = movie$title,
+    original_title = movie$original_title,
+    budget = movie$budget,
+    reported_revenue = movie$revenue,
+    runtime_minutes = movie$runtime,
+    genres = paste(movie$genres$name, collapse = ", "),
+    original_language = movie$original_language,
+    tmdb_release_date = movie$release_date,
+    status = movie$status
+  )
+}
+
+# Test the function on Barbie before processing all 20
+barbie_details <- get_tmdb_details(346698)
+
+print(barbie_details, width = Inf)
+
+```
+
+```{r}
+
+# Collect financial and descriptive data for all 20 movies
+# Use the confirmed TMDb IDs from the shared movie master
+
+tmdb_details <- purrr::map_dfr(
+  movie_master$tmdb_id,
+  get_tmdb_details
+)
+
+# Merge results with permanent project movie IDs
+movie_tmdb_raw <- movie_master |>
+  left_join(
+    tmdb_details,
+    by = "tmdb_id"
+  )
+
+# Validate the collection
+stopifnot(
+  nrow(movie_tmdb_raw) == 20,
+  !anyDuplicated(movie_tmdb_raw$movie_id),
+  !anyDuplicated(movie_tmdb_raw$tmdb_id)
+)
+
+# Check data completeness
+movie_tmdb_raw |>
+  summarise(
+    total_movies = n(),
+    missing_budget = sum(is.na(budget) | budget == 0),
+    missing_revenue = sum(
+      is.na(reported_revenue) | reported_revenue == 0
+    ),
+    missing_runtime = sum(
+      is.na(runtime_minutes) | runtime_minutes == 0
+    )
+  )
+
+
+# Display all 20 movie financial records
+movie_tmdb_raw |>
+  select(
+    movie_id,
+    title,
+    release_year,
+    budget,
+    reported_revenue,
+    runtime_minutes
+  ) |>
+  as_tibble() |>
+  print(n = 20)
+
+```
+
+```{r}
+
+# Identify movies with usable financial information
+
+movie_financial_check <- movie_tmdb_raw |>
+  mutate(
+    budget_available = !is.na(budget) & budget > 0,
+    revenue_available = !is.na(reported_revenue) &
+      reported_revenue > 0,
+    financials_complete = budget_available &
+      revenue_available
+  )
+
+# Show each movie's financial-data status
+movie_financial_check |>
+  select(
+    movie_id,
+    title,
+    release_year,
+    budget_available,
+    revenue_available,
+    financials_complete
+  ) |>
+  as_tibble() |>
+  print(n = 20)
+
+# Summarize financial coverage
+movie_financial_check |>
+  summarise(
+    total_movies = n(),
+    complete_financials = sum(financials_complete),
+    incomplete_financials = sum(!financials_complete)
+  )
+
+```
+
+```{r}
+
+# Clean financial data and preserve all 20 movies
+
+movie_tmdb <- movie_financial_check |>
+  mutate(
+    # TMDb uses zero for some unavailable financial figures
+    budget = if_else(budget > 0, as.numeric(budget), NA_real_),
+    reported_revenue = if_else(
+      reported_revenue > 0,
+      as.numeric(reported_revenue),
+      NA_real_
+    ),
+
+    # Only calculate the ratio when both values are usable
+    box_office_to_budget_ratio = if_else(
+      financials_complete,
+      reported_revenue / budget,
+      NA_real_
+    ),
+
+    # Document the source of the financial information
+    financial_source = "TMDb API"
+  )
+
+# Validate the cleaned data
+stopifnot(
+  nrow(movie_tmdb) == 20,
+  !anyDuplicated(movie_tmdb$movie_id),
+  sum(movie_tmdb$financials_complete) == 15,
+  sum(!is.na(movie_tmdb$box_office_to_budget_ratio)) == 15
+)
+
+# Save the cleaned dataset
+dir.create(
+  "data/processed",
+  recursive = TRUE,
+  showWarnings = FALSE
+)
+
+write.csv(
+  movie_tmdb,
+  "data/processed/movie_tmdb.csv",
+  row.names = FALSE
+)
+
+# Confirm the output
+file.exists("data/processed/movie_tmdb.csv")
+
+```
+
+```{r}
+
+# Create shared movie identifiers for teammates
+
+movie_ids <- movie_master |>
+  transmute(
+    movie_id = movie_id,
+    tmdb_id = tmdb_id,
+    wikidata_id = NA_character_,
+    match_status = "tmdb_matched"
+  )
+
+# Validate the ID mapping
+stopifnot(
+  nrow(movie_ids) == 20,
+  !anyDuplicated(movie_ids$movie_id),
+  !anyDuplicated(movie_ids$tmdb_id)
+)
+
+# Export using base R
+write.csv(
+  movie_ids,
+  "data/processed/movie_ids.csv",
+  row.names = FALSE
+)
+
+# Verify the file was saved
+file.exists("data/processed/movie_ids.csv")
+
+# Check the first five records
+head(movie_ids, 5)
+
+```
+
+```{r}
+
+# Retrieve the earliest U.S. theatrical release date
+# Type 2 = limited theatrical
+# Type 3 = theatrical
+
+get_us_release_date <- function(tmdb_id) {
+
+  response <- request(
+    paste0(
+      "https://api.themoviedb.org/3/movie/",
+      tmdb_id,
+      "/release_dates"
+    )
+  ) |>
+    req_auth_bearer_token(Sys.getenv("TMDB_TOKEN")) |>
+    req_retry(max_tries = 3) |>
+    req_perform()
+
+  release_data <- resp_body_json(
+    response,
+    simplifyVector = FALSE
+  )
+
+  us_records <- purrr::keep(
+    release_data$results,
+    function(x) identical(x$iso_3166_1, "US")
+  )
+
+  if (length(us_records) == 0) {
+    return(as.Date(NA))
+  }
+
+  theatrical <- purrr::keep(
+    us_records[[1]]$release_dates,
+    function(x) x$type %in% c(2, 3)
+  )
+
+  if (length(theatrical) == 0) {
+    return(as.Date(NA))
+  }
+
+  dates <- purrr::map_chr(
+    theatrical,
+    function(x) substr(x$release_date, 1, 10)
+  )
+
+  min(as.Date(dates), na.rm = TRUE)
+}
+
+# Retrieve the date for all 20 movies
+us_release_dates <- purrr::map(
+  movie_tmdb$tmdb_id,
+  get_us_release_date
+) |>
+  unlist() |>
+  as.Date(origin = "1970-01-01")
+
+# Display results without changing the saved dataset yet
+release_check <- data.frame(
+  movie_id = movie_tmdb$movie_id,
+  title = movie_tmdb$title,
+  release_year = movie_tmdb$release_year,
+  us_theatrical_date = us_release_dates
+)
+
+print(release_check, row.names = FALSE)
+
+# Check for missing U.S. theatrical dates
+sum(is.na(us_release_dates))
+
+```
+
+```{r}
+
+# Add verified U.S. theatrical dates to the TMDb dataset
+movie_tmdb <- movie_tmdb |>
+  mutate(
+    us_theatrical_date = as.Date(us_release_dates),
+
+    # Verify theatrical release year matches the master list
+    theatrical_year_matches = (
+      as.integer(format(us_theatrical_date, "%Y")) ==
+        release_year
+    )
+  )
+
+# Validate movie identifiers and release dates
+stopifnot(
+  nrow(movie_tmdb) == 20,
+  !anyDuplicated(movie_tmdb$movie_id),
+  !anyDuplicated(movie_tmdb$tmdb_id),
+  sum(is.na(movie_tmdb$us_theatrical_date)) == 0,
+  all(movie_tmdb$theatrical_year_matches)
+)
+
+# Save updated cleaned dataset
+write.csv(
+  movie_tmdb,
+  "data/processed/movie_tmdb.csv",
+  row.names = FALSE
+)
+
+# Verify saved dataset
+saved_tmdb <- read.csv(
+  "data/processed/movie_tmdb.csv"
+)
+
+nrow(saved_tmdb)
+table(saved_tmdb$financials_complete)
+file.exists("data/processed/movie_tmdb.csv")
+
+```
+
+```{r}
+
+# Compare financial-data coverage by selection method
+
+movie_tmdb |>
+  group_by(selection_method) |>
+  summarise(
+    total_movies = n(),
+    complete_financials = sum(financials_complete),
+    missing_financials = sum(!financials_complete),
+    coverage_pct = round(
+      100 * mean(financials_complete), 1
+    ),
+    .groups = "drop"
+  )
+
+```
+
+```{r}
+
+# Save financial coverage by selection method
+
+financial_coverage <- movie_tmdb |>
+  group_by(selection_method) |>
+  summarise(
+    total_movies = n(),
+    complete_financials = sum(financials_complete),
+    missing_financials = sum(!financials_complete),
+    coverage_pct = round(
+      100 * mean(financials_complete), 1
+    ),
+    .groups = "drop"
+  )
+
+# Export the validation summary
+write.csv(
+  financial_coverage,
+  "data/processed/financial_coverage_summary.csv",
+  row.names = FALSE
+)
+
+# Verify export
+file.exists(
+  "data/processed/financial_coverage_summary.csv"
+)
+
+```
+
