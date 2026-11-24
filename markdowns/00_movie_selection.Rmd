@@ -1,0 +1,733 @@
+---
+title: "ISA 401 - Movie Selection"
+author: "Aliya"
+output: html_document
+---
+
+```{r setup, message=FALSE, warning=FALSE}
+# Load packages for collecting and organizing movie data
+library(tidyverse)
+library(httr2)
+library(jsonlite)
+
+# Make random movie selection reproducible
+set.seed(401)
+
+# Run R Markdown chunks from the project root
+knitr::opts_knit$set(root.dir = normalizePath(".."))
+
+```
+
+
+```{r verify_project_paths}
+getwd()
+file.exists("data/processed/movie_master.csv")
+nrow(read.csv("data/processed/movie_master.csv"))
+```
+
+
+## Test TMDb API Connection
+
+```{r test_tmdb}
+# Search for Barbie (2023) using the TMDb API
+
+response <- request("https://api.themoviedb.org/3/search/movie") |>
+  req_auth_bearer_token(Sys.getenv("TMDB_TOKEN")) |>
+  req_url_query(
+    query = "Barbie",
+    year = 2023
+  ) |>
+  req_perform()
+
+# Convert the API response into an R list
+movie_results <- resp_body_json(response, simplifyVector = TRUE)
+
+# Display the matching movie titles and release dates
+movie_results$results |>
+  select(id, title, release_date) |>
+  head(10)
+```
+
+
+
+## Test Movie Financial Data
+
+```{r test_financials}
+# Retrieve details for Barbie using its confirmed TMDb ID
+barbie_response <- request(
+  "https://api.themoviedb.org/3/movie/346698"
+) |>
+  req_auth_bearer_token(Sys.getenv("TMDB_TOKEN")) |>
+  req_perform()
+
+barbie <- resp_body_json(
+  barbie_response,
+  simplifyVector = TRUE
+)
+
+# Display key financial and movie characteristics
+tibble(
+  movie_id = barbie$id,
+  title = barbie$title,
+  budget = barbie$budget,
+  revenue = barbie$revenue,
+  runtime = barbie$runtime,
+  genres = paste(barbie$genres$name, collapse = ", ")
+)
+```
+
+
+## Build the Movie Candidate Pool
+
+```{r candidate_pool_test}
+# Retrieve one page of movie candidates from TMDb
+
+pool_response <- request(
+  "https://api.themoviedb.org/3/discover/movie"
+) |>
+  req_auth_bearer_token(Sys.getenv("TMDB_TOKEN")) |>
+  req_url_query(
+    "primary_release_date.gte" = "2023-01-01",
+    "primary_release_date.lte" = "2025-12-31",
+    "with_release_type" = "2|3",
+    "region" = "US",
+    "sort_by" = "primary_release_date.asc",
+    "page" = 1
+  ) |>
+  req_perform()
+
+pool_data <- resp_body_json(
+  pool_response,
+  simplifyVector = TRUE
+)
+
+# Check number of matching pages and movies
+data.frame(
+  total_results = pool_data$total_results,
+  total_pages = pool_data$total_pages
+)
+
+# Display first ten candidate movies
+pool_data$results |>
+  select(id, title, release_date) |>
+  head(10)
+```
+```{r}
+
+# Test retrieving multiple pages from TMDb
+
+get_movie_page <- function(page_number) {
+
+  response <- request(
+    "https://api.themoviedb.org/3/discover/movie"
+  ) |>
+    req_auth_bearer_token(Sys.getenv("TMDB_TOKEN")) |>
+    req_url_query(
+      "primary_release_date.gte" = "2023-01-01",
+      "primary_release_date.lte" = "2025-12-31",
+      "with_release_type" = "2|3",
+      "region" = "US",
+      "sort_by" = "primary_release_date.asc",
+      page = page_number
+    ) |>
+    req_retry(max_tries = 3) |>
+    req_perform()
+
+  data <- resp_body_json(response, simplifyVector = TRUE)
+
+  as_tibble(data$results) |>
+    select(id, title, release_date)
+}
+
+# Start with five pages to test the workflow
+test_pool <- purrr::map_dfr(1:5, get_movie_page)
+
+# Check how many records we collected
+nrow(test_pool)
+
+# Preview the first ten movies
+head(test_pool, 10)
+
+# Check for duplicate TMDb movie IDs
+sum(duplicated(test_pool$id))
+
+```
+```{r}
+
+# Build a reproducible candidate pool for 2023–2025
+
+get_year_page <- function(year, page_number) {
+
+  response <- request(
+    "https://api.themoviedb.org/3/discover/movie"
+  ) |>
+    req_auth_bearer_token(Sys.getenv("TMDB_TOKEN")) |>
+    req_url_query(
+      "primary_release_date.gte" = paste0(year, "-01-01"),
+      "primary_release_date.lte" = paste0(year, "-12-31"),
+      "with_release_type" = "2|3",
+      "region" = "US",
+      "sort_by" = "popularity.desc",
+      "vote_count.gte" = 100,
+      page = page_number
+    ) |>
+    req_retry(max_tries = 3) |>
+    req_perform()
+
+  data <- resp_body_json(response, simplifyVector = TRUE)
+
+  as_tibble(data$results) |>
+    select(id, title, release_date)
+}
+
+# Retrieve 25 pages per year (maximum 500 per year)
+candidate_pool <- purrr::map_dfr(
+  2023:2025,
+  function(year) {
+    purrr::map_dfr(
+      1:25,
+      function(page) get_year_page(year, page) |>
+        mutate(selection_year = year)
+    )
+  }
+) |>
+  distinct(id, .keep_all = TRUE)
+
+# Check number of movies in each year
+candidate_pool |>
+  count(selection_year)
+
+# Check for duplicate TMDb IDs
+sum(duplicated(candidate_pool$id))
+
+```
+
+```{r}
+
+# Check the candidate pool before saving
+stopifnot(
+  nrow(candidate_pool) == 1487,
+  !anyDuplicated(candidate_pool$id),
+  !anyNA(candidate_pool$id)
+)
+
+# Record when the candidate pool was collected
+candidate_pool <- candidate_pool |>
+  mutate(
+    retrieval_date = as.character(Sys.Date())
+  )
+
+# Create the raw data folder if necessary
+dir.create(
+  "data/raw",
+  recursive = TRUE,
+  showWarnings = FALSE
+)
+
+# Save the candidate pool for reproducibility
+
+# Save candidate pool using base R
+write.csv(
+  candidate_pool,
+  "data/raw/tmdb_candidate_pool.csv",
+  row.names = FALSE
+)
+
+# Confirm the file was created
+file.exists("data/raw/tmdb_candidate_pool.csv")
+
+```
+
+```{r}
+
+# Select 15 random movies: 5 per year
+# Fixed seed makes selection reproducible
+
+set.seed(401)
+
+random_movies <- candidate_pool |>
+  group_by(selection_year) |>
+  slice_sample(n = 5) |>
+  ungroup() |>
+  arrange(selection_year, title) |>
+  mutate(selection_method = "random")
+
+# Display the 15 selected movies
+random_movies |>
+  select(id, title, selection_year, selection_method)
+
+# Verify selection counts
+random_movies |>
+  count(selection_year)
+
+# Verify no duplicate movie IDs
+sum(duplicated(random_movies$id))
+
+```
+
+```{r}
+
+# Check U.S. theatrical release information
+
+get_us_theatrical <- function(tmdb_id) {
+
+  response <- request(
+    paste0(
+      "https://api.themoviedb.org/3/movie/",
+      tmdb_id,
+      "/release_dates"
+    )
+  ) |>
+    req_auth_bearer_token(Sys.getenv("TMDB_TOKEN")) |>
+    req_retry(max_tries = 3) |>
+    req_perform()
+
+  release_data <- resp_body_json(
+    response,
+    simplifyVector = FALSE
+  )
+
+  # Find the U.S. release records
+  us <- purrr::keep(
+    release_data$results,
+    function(x) identical(x$iso_3166_1, "US")
+  )
+
+  if (length(us) == 0) return(FALSE)
+
+  # Types 2 and 3 represent limited/theatrical releases
+  any(purrr::map_lgl(
+    us[[1]]$release_dates,
+    function(x) x$type %in% c(2, 3)
+  ))
+}
+
+# Check all 15 selected movies
+random_movies <- random_movies |>
+  mutate(
+    us_theatrical = purrr::map_lgl(id, get_us_theatrical)
+  )
+
+# Display the results
+random_movies |>
+  select(title, selection_year, us_theatrical)
+
+# Count movies that pass
+random_movies |>
+  count(us_theatrical)
+
+```
+
+```{r}
+
+# Save original random selections and eligibility checks
+
+dir.create(
+  "data/processed",
+  recursive = TRUE,
+  showWarnings = FALSE
+)
+
+write.csv(
+  random_movies,
+  "data/processed/random_movie_eligibility.csv",
+  row.names = FALSE
+)
+
+# Verify that all 15 selections were saved
+saved_check <- read.csv(
+  "data/processed/random_movie_eligibility.csv"
+)
+
+nrow(saved_check)
+
+table(saved_check$us_theatrical)
+
+file.exists(
+  "data/processed/random_movie_eligibility.csv"
+)
+
+```
+
+```{r}
+
+# Verify U.S. theatrical releases within the assigned year
+# TMDb release types 2 = limited theatrical, 3 = theatrical
+
+get_us_theatrical_year <- function(tmdb_id, year) {
+
+  response <- request(
+    paste0(
+      "https://api.themoviedb.org/3/movie/",
+      tmdb_id,
+      "/release_dates"
+    )
+  ) |>
+    req_auth_bearer_token(Sys.getenv("TMDB_TOKEN")) |>
+    req_retry(max_tries = 3) |>
+    req_perform()
+
+  release_data <- resp_body_json(
+    response,
+    simplifyVector = FALSE
+  )
+
+  us <- purrr::keep(
+    release_data$results,
+    function(x) identical(x$iso_3166_1, "US")
+  )
+
+  if (length(us) == 0) return(FALSE)
+
+  dates <- us[[1]]$release_dates
+
+  any(purrr::map_lgl(dates, function(x) {
+
+    release_year <- substr(x$release_date, 1, 4)
+
+    x$type %in% c(2, 3) &&
+      release_year == as.character(year)
+
+  }))
+}
+
+# Recheck our six previously qualifying movies
+previously_eligible <- random_movies |>
+  filter(us_theatrical == TRUE)
+
+previously_eligible$correct_year <- purrr::map2_lgl(
+  previously_eligible$id,
+  previously_eligible$selection_year,
+  get_us_theatrical_year
+)
+
+# Display results
+previously_eligible |>
+  select(title, selection_year, correct_year)
+
+# Count movies that pass the stronger check
+table(previously_eligible$correct_year)
+
+```
+
+```{r}
+
+# Create a reproducible randomized replacement list
+
+# Exclude all 15 movies from the original random draw
+remaining_candidates <- candidate_pool |>
+  filter(!id %in% random_movies$id)
+
+# Use a separate fixed seed for replacement sampling
+set.seed(402)
+
+replacement_queue <- remaining_candidates |>
+  group_by(selection_year) |>
+  slice_sample(prop = 1) |>
+  ungroup() |>
+  group_by(selection_year) |>
+  mutate(replacement_order = row_number()) |>
+  ungroup()
+
+# Check the number of available replacements per year
+replacement_queue |>
+  count(selection_year)
+
+# Preview the first five replacement candidates per year
+replacement_queue |>
+  group_by(selection_year) |>
+  slice_head(n = 5) |>
+  ungroup() |>
+  select(
+    title,
+    selection_year,
+    replacement_order
+  )
+
+```
+
+```{r}
+
+# Test the first 5 replacement candidates from each year
+
+replacement_test <- replacement_queue |>
+  group_by(selection_year) |>
+  slice_head(n = 5) |>
+  ungroup()
+
+# Use the improved U.S. theatrical release check
+replacement_test$correct_year <- purrr::map2_lgl(
+  replacement_test$id,
+  replacement_test$selection_year,
+  get_us_theatrical_year
+)
+
+# Display eligibility results
+replacement_test |>
+  select(
+    title,
+    selection_year,
+    replacement_order,
+    correct_year
+  )
+
+# Count eligible replacements by year
+replacement_test |>
+  filter(correct_year == TRUE) |>
+  count(selection_year)
+
+```
+
+```{r}
+
+# Check the next five 2025 replacement candidates
+# Continue after replacement orders 1 through 5
+
+next_2025 <- replacement_queue |>
+  filter(
+    selection_year == 2025,
+    replacement_order >= 6,
+    replacement_order <= 10
+  )
+
+# Verify each movie's U.S. theatrical release year
+next_2025$correct_year <- purrr::map2_lgl(
+  next_2025$id,
+  next_2025$selection_year,
+  get_us_theatrical_year
+)
+
+# Display results in randomized order
+next_2025 |>
+  select(
+    title,
+    selection_year,
+    replacement_order,
+    correct_year
+  )
+
+```
+
+```{r}
+
+# Keep the 6 original movies that passed validation
+original_valid <- previously_eligible |>
+  filter(correct_year == TRUE) |>
+  select(id, title, release_date, selection_year)
+
+# Keep the first eligible replacements needed per year
+
+# Select the required number of eligible replacements
+# in their original randomized order
+
+valid_replacements <- bind_rows(
+  replacement_test,
+  next_2025
+) |>
+  filter(correct_year == TRUE) |>
+  arrange(selection_year, replacement_order) |>
+  group_by(selection_year) |>
+  mutate(
+    replacement_rank = row_number(),
+    replacements_needed = case_when(
+      selection_year == 2023 ~ 2L,
+      selection_year == 2024 ~ 4L,
+      selection_year == 2025 ~ 3L
+    )
+  ) |>
+  filter(replacement_rank <= replacements_needed) |>
+  ungroup() |>
+  select(id, title, release_date, selection_year)
+
+
+# Combine original movies and replacements
+final_random_movies <- bind_rows(
+  original_valid,
+  valid_replacements
+) |>
+  arrange(selection_year, title) |>
+  mutate(selection_method = "random")
+
+# Validate the final sample
+stopifnot(
+  nrow(final_random_movies) == 15,
+  !anyDuplicated(final_random_movies$id)
+)
+
+# Display all 15 movies
+print(final_random_movies, n = 15)
+
+# Save to your project folder
+write.csv(
+  final_random_movies,
+  "data/processed/final_random_movies.csv",
+  row.names = FALSE
+)
+
+# Confirm the file exists
+file.exists("data/processed/final_random_movies.csv")
+
+```
+
+```{r}
+
+final_random_movies |>
+  filter(title %in% c(
+    "Barbie",
+    "Oppenheimer",
+    "Past Lives",
+    "Dune: Part Two",
+    "The Substance"
+  )) |>
+  select(title, selection_year)
+
+```
+
+```{r}
+
+# Five intentionally selected movies
+intentional_movies <- tibble(
+  title = c(
+    "Barbie",
+    "Oppenheimer",
+    "Past Lives",
+    "Dune: Part Two",
+    "The Substance"
+  ),
+  selection_year = c(2023, 2023, 2023, 2024, 2024),
+  selection_method = "intentional"
+)
+
+# Search TMDb for the correct movie IDs
+search_movie <- function(title, year) {
+
+# Resolve the verified ambiguous Past Lives match
+if (title == "Past Lives" && year == 2023) {
+  return(tibble(
+    id = 666277L,
+    release_date = "2023-06-02"
+  ))
+}
+
+  response <- request(
+    "https://api.themoviedb.org/3/search/movie"
+  ) |>
+    req_auth_bearer_token(Sys.getenv("TMDB_TOKEN")) |>
+    req_url_query(
+      query = title,
+      year = year
+    ) |>
+    req_retry(max_tries = 3) |>
+    req_perform()
+
+  results <- resp_body_json(
+    response,
+    simplifyVector = TRUE
+  )$results
+
+  # Keep exact title and release-year matches
+  matches <- results |>
+    as_tibble() |>
+    filter(
+      title == !!title,
+      substr(release_date, 1, 4) == as.character(year)
+    )
+
+  if (nrow(matches) != 1) {
+    stop(paste("Review TMDb match for:", title))
+  }
+
+  matches |>
+    select(id, release_date)
+}
+
+# Retrieve IDs for all five movies
+intentional_matches <- purrr::map2_dfr(
+  intentional_movies$title,
+  intentional_movies$selection_year,
+  search_movie
+)
+
+# Combine selections with verified IDs
+intentional_movies <- bind_cols(
+  intentional_movies,
+  intentional_matches
+)
+
+# Display all five records
+intentional_movies |>
+  select(id, title, selection_year, release_date)
+
+```
+
+```{r}
+
+# Validate U.S. theatrical releases for intentional movies
+
+intentional_movies$us_theatrical <- purrr::map2_lgl(
+  intentional_movies$id,
+  intentional_movies$selection_year,
+  get_us_theatrical_year
+)
+
+# Display validation results
+intentional_movies |>
+  select(
+    title,
+    selection_year,
+    us_theatrical
+  )
+
+# Verify that all five qualify
+table(intentional_movies$us_theatrical)
+
+```
+
+```{r}
+
+# Combine random and intentional pilot movies
+
+movie_master <- bind_rows(
+  final_random_movies |>
+    select(id, title, selection_year, selection_method),
+  intentional_movies |>
+    select(id, title, selection_year, selection_method)
+) |>
+  arrange(selection_year, selection_method, title) |>
+  mutate(
+    movie_id = row_number(),
+    tmdb_id = id,
+    release_year = selection_year
+  ) |>
+  select(
+    movie_id,
+    tmdb_id,
+    title,
+    release_year,
+    selection_method
+  )
+
+# Validate the master dataset
+stopifnot(
+  nrow(movie_master) == 20,
+  !anyDuplicated(movie_master$movie_id),
+  !anyDuplicated(movie_master$tmdb_id),
+  sum(movie_master$selection_method == "random") == 15,
+  sum(movie_master$selection_method == "intentional") == 5
+)
+
+# Display all 20 movies
+print(movie_master, n = 20)
+
+# Export using base R
+write.csv(
+  movie_master,
+  "data/processed/movie_master.csv",
+  row.names = FALSE
+)
+
+# Confirm the file exists
+file.exists("data/processed/movie_master.csv")
+
+```
+
